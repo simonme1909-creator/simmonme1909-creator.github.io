@@ -3,6 +3,8 @@
 Technische Auswertung und Kapitelentwurf für die Dokumentation zum Betrieblichen Auftrag.
 Grundlage: `AP2_HTML_DASHBOARD_V4_FINAL.php` (157 Zeilen, ca. 160 KB, davon ca. 140 KB eingebettetes Logo).
 
+> **Stand:** Die in A.8 genannten Schwächen sind in Version 5 behoben (`AP2_HTML_DASHBOARD_V5.php`). Erklärung und Änderungsliste siehe `AP2_Dashboard_V5_Code_Erklaerung.md`. Dieses Dokument beschreibt den Stand V4 und eignet sich als „Ist-Analyse“ vor der Überarbeitung.
+
 > **Hinweis zur Vollständigkeit:** Ausgewertet wurde nur diese eine Datei. Die Datenquelle (`/hook/ap2-data`), die Symcon-Skripte, KNX-/DALI-Anbindung und die CATAN-Konfiguration liegen nicht vor. Alles dazu ist aus dem Frontend abgeleitet und mit `[ANPASSEN]` markiert, wo du echte Werte aus deinem Projekt einsetzen musst.
 
 ---
