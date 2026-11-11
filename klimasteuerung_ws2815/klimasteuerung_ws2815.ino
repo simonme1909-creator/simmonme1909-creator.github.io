@@ -13,9 +13,11 @@
  *
  *  A1 : Temperaturspannung 0..5 V  (linear auf TEMP_BEI_0V .. TEMP_BEI_5V)
  *  A2 : Helligkeitsspannung 0..5 V (0 V = dunkel, 5 V = hell)
+ *  D2 : Schalter Sommer/Winter gegen GND (geschlossen = Sommer, offen = Winter)
  *
  *  Regelverhalten
  *  --------------
+ *  - Sommerbetrieb: Sollwert 22,0 Grad C, Winterbetrieb: Sollwert 25,0 Grad C.
  *  - Zweipunktverhalten mit Hysterese um den Sollwert (kein Flattern an der
  *    Schaltschwelle). Zwischen Heizen und Kuehlen liegt ein Totband.
  *  - Je groesser die Regelabweichung, desto schneller laeuft das Lauflicht.
@@ -27,6 +29,7 @@
  *  D5 -> 330..470 Ohm -> DI Streifen HEIZEN
  *  D6 -> 330..470 Ohm -> DI Streifen KUEHLEN
  *  D7 -> 330..470 Ohm -> DI Streifen JALOUSIE
+ *  D2 -> Schalter -> GND (interner Pull-up, kein externer Widerstand noetig)
  *  BI (Backup-Eingang) der jeweils ersten LED auf GND legen.
  *  12-V-Netzteil versorgt die Streifen. GND Netzteil und GND Arduino verbinden!
  *  NIEMALS 12 V an den 5-V-Pin oder an einen I/O-Pin des Arduino legen.
@@ -51,6 +54,7 @@ const uint8_t PIN_LED_KUEHLEN  = 6;
 const uint8_t PIN_LED_JALOUSIE = 7;
 const uint8_t PIN_TEMPERATUR   = A1;
 const uint8_t PIN_HELLIGKEIT   = A2;
+const uint8_t PIN_SOMMERBETRIEB = 2;              // Schalter gegen GND: geschlossen = Sommer
 
 // ---- LED-Streifen ----------------------------------------------------------
 // WS2815 nutzt dasselbe Datenprotokoll wie WS2812B (800 kHz, Farbfolge GRB).
@@ -70,10 +74,15 @@ const CRGB FARBE_JALOUSIE = CRGB(255, 220, 180);  // Neutralweiss (reines 255/25
 // ---- Temperatur (alle Werte in Zehntel Grad: 215 = 21,5 Grad C) ------------
 const int16_t TEMP_BEI_0V     = 0;                // Temperatur bei 0 V an A1
 const int16_t TEMP_BEI_5V     = 400;              // Temperatur bei 5 V an A1
-const int16_t TEMP_SOLL       = 210;              // Sollwert
+const int16_t TEMP_SOLL_SOMMER = 220;             // Sollwert im Sommerbetrieb
+const int16_t TEMP_SOLL_WINTER = 250;             // Sollwert im Winterbetrieb
 const int16_t HYSTERESE_EIN   = 10;               // Einschalten bei Soll -/+ 1,0 K
 const int16_t HYSTERESE_AUS   = 3;                // Ausschalten bei Soll -/+ 0,3 K
 const int16_t ABWEICHUNG_VOLL = 100;              // ab 10 K Abweichung: maximales Tempo
+
+// false: Heizen und Kuehlen sind in beiden Betriebsarten moeglich, nur der Sollwert wechselt
+// true : im Sommer wird nur gekuehlt, im Winter nur geheizt
+const bool SOMMER_NUR_KUEHLEN_WINTER_NUR_HEIZEN = false;
 
 // ---- Lauflicht -------------------------------------------------------------
 const uint8_t TEMPO_MIN_LED_S   = 4;              // LEDs pro Sekunde bei kleiner Abweichung
@@ -97,6 +106,7 @@ const uint16_t LAMPENTEST_MS = 400;               // Dauer je Streifen beim Eins
 // ---- Messwertaufbereitung --------------------------------------------------
 const uint8_t MESSUNGEN_JE_ZYKLUS = 8;            // Ueberabtastung (Mittelung gegen Rauschen)
 const uint8_t FILTER_TEILER       = 8;            // Tiefpass: groesser = ruhiger, aber traeger
+const uint8_t ENTPRELL_ZYKLEN     = 3;            // Schalter muss 3 Zyklen (60 ms) stabil anliegen
 
 // =============================================================================
 //  2. ABGELEITETE KONSTANTEN  (nicht aendern)
@@ -119,12 +129,13 @@ static_assert(SCHWEIF_LEDS < ANZAHL_HEIZEN && SCHWEIF_LEDS < ANZAHL_KUEHLEN, "Sc
 static_assert(JALOUSIE_SCHRITT > 0, "JALOUSIE_FAHRZEIT_MS ist zu gross");
 static_assert(MESSUNGEN_JE_ZYKLUS >= 1 && MESSUNGEN_JE_ZYKLUS <= 64, "MESSUNGEN_JE_ZYKLUS: 1..64");
 static_assert(FILTER_TEILER >= 1, "FILTER_TEILER muss mindestens 1 sein");
+static_assert(ENTPRELL_ZYKLEN >= 1, "ENTPRELL_ZYKLEN muss mindestens 1 sein");
 
 // =============================================================================
 //  3. BAUSTEINE
 // =============================================================================
 
-enum class Betriebsart : uint8_t { Neutral, Heizen, Kuehlen };
+enum class Regelzustand : uint8_t { Neutral, Heizen, Kuehlen };
 
 // -----------------------------------------------------------------------------
 //  Analogeingang mit Ueberabtastung und Tiefpass 1. Ordnung
@@ -159,7 +170,40 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+//  Entprellter Digitaleingang (Schalter gegen GND, interner Pull-up)
+//  Ein Wechsel wird erst uebernommen, wenn er ENTPRELL_ZYKLEN lang stabil anliegt.
+// -----------------------------------------------------------------------------
+class DigitalEingang {
+public:
+  explicit DigitalEingang(uint8_t pin) : pin_(pin), zustand_(false), zaehler_(0) {}
+
+  void begin() {
+    pinMode(pin_, INPUT_PULLUP);
+    zustand_ = lesen();
+  }
+
+  void update() {
+    if (lesen() == zustand_) {
+      zaehler_ = 0;                               // kein Wechsel oder nur Prellen
+    } else if (++zaehler_ >= ENTPRELL_ZYKLEN) {
+      zustand_ = !zustand_;                       // Wechsel liegt stabil an -> uebernehmen
+      zaehler_ = 0;
+    }
+  }
+
+  bool aktiv() const { return zustand_; }         // true = Schalter geschlossen
+
+private:
+  bool lesen() const { return digitalRead(pin_) == LOW; }   // Pull-up: geschlossen = LOW
+
+  const uint8_t pin_;
+  bool zustand_;
+  uint8_t zaehler_;
+};
+
+// -----------------------------------------------------------------------------
 //  Zweipunktregler mit Hysterese und Totband
+//  Der Sollwert haengt von der Betriebsart ab (Sommer / Winter).
 //
 //        HEIZEN            NEUTRAL            KUEHLEN
 //   -----------|----|-------- Soll --------|----|----------->  Temperatur
@@ -167,28 +211,33 @@ private:
 // -----------------------------------------------------------------------------
 class Klimaregler {
 public:
-  void update(int16_t temperatur) {
-    abweichung_ = temperatur - TEMP_SOLL;
+  void update(int16_t temperatur, bool sommerbetrieb) {
+    sollwert_   = sommerbetrieb ? TEMP_SOLL_SOMMER : TEMP_SOLL_WINTER;
+    abweichung_ = temperatur - sollwert_;
 
-    switch (betriebsart_) {
-      case Betriebsart::Heizen:
-        if (abweichung_ >= -HYSTERESE_AUS) betriebsart_ = Betriebsart::Neutral;
+    const bool heizenFrei  = !(SOMMER_NUR_KUEHLEN_WINTER_NUR_HEIZEN && sommerbetrieb);
+    const bool kuehlenFrei = !(SOMMER_NUR_KUEHLEN_WINTER_NUR_HEIZEN && !sommerbetrieb);
+
+    switch (zustand_) {
+      case Regelzustand::Heizen:
+        if (abweichung_ >= -HYSTERESE_AUS || !heizenFrei) zustand_ = Regelzustand::Neutral;
         break;
 
-      case Betriebsart::Kuehlen:
-        if (abweichung_ <= HYSTERESE_AUS) betriebsart_ = Betriebsart::Neutral;
+      case Regelzustand::Kuehlen:
+        if (abweichung_ <= HYSTERESE_AUS || !kuehlenFrei) zustand_ = Regelzustand::Neutral;
         break;
 
-      case Betriebsart::Neutral:
-        if (abweichung_ <= -HYSTERESE_EIN)      betriebsart_ = Betriebsart::Heizen;
-        else if (abweichung_ >= HYSTERESE_EIN)  betriebsart_ = Betriebsart::Kuehlen;
+      case Regelzustand::Neutral:
+        if (abweichung_ <= -HYSTERESE_EIN && heizenFrei)       zustand_ = Regelzustand::Heizen;
+        else if (abweichung_ >= HYSTERESE_EIN && kuehlenFrei)  zustand_ = Regelzustand::Kuehlen;
         break;
     }
   }
 
-  Betriebsart betriebsart() const { return betriebsart_; }
-  bool heizt()  const { return betriebsart_ == Betriebsart::Heizen; }
-  bool kuehlt() const { return betriebsart_ == Betriebsart::Kuehlen; }
+  Regelzustand zustand() const { return zustand_; }
+  int16_t sollwert() const { return sollwert_; }
+  bool heizt()  const { return zustand_ == Regelzustand::Heizen; }
+  bool kuehlt() const { return zustand_ == Regelzustand::Kuehlen; }
 
   // Lauflichttempo in 1/256 LED pro Sekunde, abhaengig vom Betrag der Abweichung
   uint16_t tempo() const {
@@ -197,7 +246,8 @@ public:
   }
 
 private:
-  Betriebsart betriebsart_ = Betriebsart::Neutral;
+  Regelzustand zustand_ = Regelzustand::Neutral;
+  int16_t sollwert_ = TEMP_SOLL_WINTER;
   int16_t abweichung_ = 0;
 };
 
@@ -324,6 +374,7 @@ CRGB ledsJalousie[ANZAHL_JALOUSIE];
 
 AnalogEingang eingangTemperatur(PIN_TEMPERATUR);
 AnalogEingang eingangHelligkeit(PIN_HELLIGKEIT);
+DigitalEingang schalterSommer(PIN_SOMMERBETRIEB);
 
 Klimaregler regler;
 Lauflicht   lauflichtHeizen(ledsHeizen, ANZAHL_HEIZEN, FARBE_HEIZEN);
@@ -361,15 +412,16 @@ void zehntelAusgeben(int16_t wert) {
 }
 
 void diagnoseAusgeben() {
-  Serial.print(F("T="));
+  Serial.print(schalterSommer.aktiv() ? F("SOMMER") : F("WINTER"));
+  Serial.print(F("  T="));
   zehntelAusgeben(temperatur);
   Serial.print(F(" C  Soll="));
-  zehntelAusgeben(TEMP_SOLL);
+  zehntelAusgeben(regler.sollwert());
   Serial.print(F(" C  Modus="));
-  switch (regler.betriebsart()) {
-    case Betriebsart::Heizen:  Serial.print(F("HEIZEN "));  break;
-    case Betriebsart::Kuehlen: Serial.print(F("KUEHLEN")); break;
-    case Betriebsart::Neutral: Serial.print(F("NEUTRAL")); break;
+  switch (regler.zustand()) {
+    case Regelzustand::Heizen:  Serial.print(F("HEIZEN "));  break;
+    case Regelzustand::Kuehlen: Serial.print(F("KUEHLEN")); break;
+    case Regelzustand::Neutral: Serial.print(F("NEUTRAL")); break;
   }
   Serial.print(F("  |  Licht="));
   zehntelAusgeben(helligkeit);
@@ -417,6 +469,7 @@ void setup() {
 
   eingangTemperatur.begin();
   eingangHelligkeit.begin();
+  schalterSommer.begin();
 
   zeitLetzterZyklus = millis();
 }
@@ -431,11 +484,12 @@ void loop() {
     // EINGABE
     eingangTemperatur.update();
     eingangHelligkeit.update();
+    schalterSommer.update();
     temperatur = temperaturBerechnen(eingangTemperatur.wert());
     helligkeit = helligkeitBerechnen(eingangHelligkeit.wert());
 
     // VERARBEITUNG
-    regler.update(temperatur);
+    regler.update(temperatur, schalterSommer.aktiv());
     lauflichtHeizen.update(regler.heizt(), regler.tempo());
     lauflichtKuehlen.update(regler.kuehlt(), regler.tempo());
     jalousie.update(helligkeit);
