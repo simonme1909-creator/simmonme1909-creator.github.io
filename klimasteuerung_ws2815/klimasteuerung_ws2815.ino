@@ -13,7 +13,7 @@
  *
  *  A1 : Temperaturspannung 0..5 V  (linear auf TEMP_BEI_0V .. TEMP_BEI_5V)
  *  A2 : Helligkeitsspannung 0..5 V (0 V = dunkel, 5 V = hell)
- *  D2 : Schalter Sommer/Winter gegen GND (geschlossen = Sommer, offen = Winter)
+ *  D2 : Drehschalter Sommer/Winter (Pegel und Zuordnung siehe Konfiguration)
  *
  *  Regelverhalten
  *  --------------
@@ -29,7 +29,8 @@
  *  D5 -> 330..470 Ohm -> DI Streifen HEIZEN
  *  D6 -> 330..470 Ohm -> DI Streifen KUEHLEN
  *  D7 -> 330..470 Ohm -> DI Streifen JALOUSIE
- *  D2 -> Schalter -> GND (interner Pull-up, kein externer Widerstand noetig)
+ *  D2 -> Drehschalter. Der Eingang vertraegt maximal 5 V! Liefert der
+ *        Schalter 12 V oder 24 V, ist ein Spannungsteiler oder Optokoppler noetig.
  *  BI (Backup-Eingang) der jeweils ersten LED auf GND legen.
  *  12-V-Netzteil versorgt die Streifen. GND Netzteil und GND Arduino verbinden!
  *  NIEMALS 12 V an den 5-V-Pin oder an einen I/O-Pin des Arduino legen.
@@ -54,7 +55,13 @@ const uint8_t PIN_LED_KUEHLEN  = 6;
 const uint8_t PIN_LED_JALOUSIE = 7;
 const uint8_t PIN_TEMPERATUR   = A1;
 const uint8_t PIN_HELLIGKEIT   = A2;
-const uint8_t PIN_SOMMERBETRIEB = 2;              // Schalter gegen GND: geschlossen = Sommer
+const uint8_t PIN_DREHSCHALTER  = 2;              // Drehschalter Sommer / Winter
+
+// ---- Drehschalter Sommer / Winter ------------------------------------------
+// true : Schalter schaltet gegen GND, interner Pull-up aktiv (offen = HIGH)
+// false: Schalter liefert selbst 0 V / 5 V (z. B. Wechsler oder externer Pull-down)
+const bool DREHSCHALTER_PULLUP = true;
+const bool SOMMER_BEI_HIGH     = false;           // Pegel am Pin, der Sommerbetrieb bedeutet
 
 // ---- LED-Streifen ----------------------------------------------------------
 // WS2815 nutzt dasselbe Datenprotokoll wie WS2812B (800 kHz, Farbfolge GRB).
@@ -106,7 +113,7 @@ const uint16_t LAMPENTEST_MS = 400;               // Dauer je Streifen beim Eins
 // ---- Messwertaufbereitung --------------------------------------------------
 const uint8_t MESSUNGEN_JE_ZYKLUS = 8;            // Ueberabtastung (Mittelung gegen Rauschen)
 const uint8_t FILTER_TEILER       = 8;            // Tiefpass: groesser = ruhiger, aber traeger
-const uint8_t ENTPRELL_ZYKLEN     = 3;            // Schalter muss 3 Zyklen (60 ms) stabil anliegen
+const uint8_t ENTPRELL_ZYKLEN     = 3;            // Drehschalter muss 3 Zyklen (60 ms) stabil anliegen
 
 // =============================================================================
 //  2. ABGELEITETE KONSTANTEN  (nicht aendern)
@@ -170,34 +177,35 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-//  Entprellter Digitaleingang (Schalter gegen GND, interner Pull-up)
+//  Entprellter Digitaleingang
 //  Ein Wechsel wird erst uebernommen, wenn er ENTPRELL_ZYKLEN lang stabil anliegt.
 // -----------------------------------------------------------------------------
 class DigitalEingang {
 public:
-  explicit DigitalEingang(uint8_t pin) : pin_(pin), zustand_(false), zaehler_(0) {}
+  DigitalEingang(uint8_t pin, bool pullup) : pin_(pin), pullup_(pullup), pegel_(false), zaehler_(0) {}
 
   void begin() {
-    pinMode(pin_, INPUT_PULLUP);
-    zustand_ = lesen();
+    pinMode(pin_, pullup_ ? INPUT_PULLUP : INPUT);
+    pegel_ = lesen();
   }
 
   void update() {
-    if (lesen() == zustand_) {
+    if (lesen() == pegel_) {
       zaehler_ = 0;                               // kein Wechsel oder nur Prellen
     } else if (++zaehler_ >= ENTPRELL_ZYKLEN) {
-      zustand_ = !zustand_;                       // Wechsel liegt stabil an -> uebernehmen
+      pegel_ = !pegel_;                           // Wechsel liegt stabil an -> uebernehmen
       zaehler_ = 0;
     }
   }
 
-  bool aktiv() const { return zustand_; }         // true = Schalter geschlossen
+  bool high() const { return pegel_; }            // entprellter Pegel am Pin
 
 private:
-  bool lesen() const { return digitalRead(pin_) == LOW; }   // Pull-up: geschlossen = LOW
+  bool lesen() const { return digitalRead(pin_) == HIGH; }
 
   const uint8_t pin_;
-  bool zustand_;
+  const bool pullup_;
+  bool pegel_;
   uint8_t zaehler_;
 };
 
@@ -374,7 +382,7 @@ CRGB ledsJalousie[ANZAHL_JALOUSIE];
 
 AnalogEingang eingangTemperatur(PIN_TEMPERATUR);
 AnalogEingang eingangHelligkeit(PIN_HELLIGKEIT);
-DigitalEingang schalterSommer(PIN_SOMMERBETRIEB);
+DigitalEingang drehschalter(PIN_DREHSCHALTER, DREHSCHALTER_PULLUP);
 
 Klimaregler regler;
 Lauflicht   lauflichtHeizen(ledsHeizen, ANZAHL_HEIZEN, FARBE_HEIZEN);
@@ -383,6 +391,7 @@ Jalousie    jalousie(ledsJalousie, ANZAHL_JALOUSIE, FARBE_JALOUSIE);
 
 int16_t  temperatur = 0;                          // Zehntel Grad
 uint16_t helligkeit = 0;                          // Promille
+bool     sommerbetrieb = false;                   // true = Sommer, false = Winter
 
 uint32_t zeitLetzterZyklus  = 0;
 uint32_t zeitLetzteDiagnose = 0;
@@ -412,7 +421,7 @@ void zehntelAusgeben(int16_t wert) {
 }
 
 void diagnoseAusgeben() {
-  Serial.print(schalterSommer.aktiv() ? F("SOMMER") : F("WINTER"));
+  Serial.print(sommerbetrieb ? F("SOMMER") : F("WINTER"));
   Serial.print(F("  T="));
   zehntelAusgeben(temperatur);
   Serial.print(F(" C  Soll="));
@@ -469,7 +478,7 @@ void setup() {
 
   eingangTemperatur.begin();
   eingangHelligkeit.begin();
-  schalterSommer.begin();
+  drehschalter.begin();
 
   zeitLetzterZyklus = millis();
 }
@@ -484,12 +493,13 @@ void loop() {
     // EINGABE
     eingangTemperatur.update();
     eingangHelligkeit.update();
-    schalterSommer.update();
+    drehschalter.update();
+    sommerbetrieb = (drehschalter.high() == SOMMER_BEI_HIGH);
     temperatur = temperaturBerechnen(eingangTemperatur.wert());
     helligkeit = helligkeitBerechnen(eingangHelligkeit.wert());
 
     // VERARBEITUNG
-    regler.update(temperatur, schalterSommer.aktiv());
+    regler.update(temperatur, sommerbetrieb);
     lauflichtHeizen.update(regler.heizt(), regler.tempo());
     lauflichtKuehlen.update(regler.kuehlt(), regler.tempo());
     jalousie.update(helligkeit);
